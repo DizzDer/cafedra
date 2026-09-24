@@ -1,5 +1,8 @@
 """АРМ Кафедра — локальный учебный проект. Python 3.10+, без зависимостей."""
 import argparse
+import sys
+import documents
+import assistant_service
 import hashlib
 import hmac
 import io
@@ -95,6 +98,8 @@ def init_db():
         con.execute('CREATE TABLE IF NOT EXISTS plan_items (id TEXT PRIMARY KEY, plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE, activity TEXT NOT NULL, due_date TEXT, status TEXT NOT NULL, source_type TEXT, source_id TEXT)')
     with db('audit') as con:
         con.execute('CREATE TABLE IF NOT EXISTS audit_events (id TEXT PRIMARY KEY, module TEXT, action TEXT, record_id TEXT, created_at TEXT)')
+    documents.init(sys.modules[__name__])
+    assistant_service.init(sys.modules[__name__])
 
 
 def audit(module, action, record_id):
@@ -284,8 +289,13 @@ def reminders(today=None):
             con.execute('INSERT OR IGNORE INTO notifications VALUES (?,?,?,?,?,0)', (str(uuid.uuid4()), row['id'], threshold, message, now()))
 
 
-def create_plan(data):
+def create_plan(data, request_id=None):
     with LOCK:
+        deterministic_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'cafedra-plan:' + request_id)) if request_id else None
+        if deterministic_id:
+            existing = get_record('plans', deterministic_id)
+            if existing:
+                return existing
         sid = student_exists(data.get('student_id'))
         year = academic_year(data.get('academic_year'))
         start = date(int(year[:4]), 9, 1)
@@ -306,7 +316,7 @@ def create_plan(data):
         for row in records('attestations'):
             if row['student_id'] == sid and row['academic_year'] == year:
                 items.append(('Ежегодная аттестация', row['due_date'], 'Выполнено' if row['status'] == 'Пройдена' else 'Запланировано', 'attestations', row['id']))
-        ident = str(uuid.uuid4())
+        ident = deterministic_id or str(uuid.uuid4())
         with db('plans') as con:
             version = con.execute('SELECT COALESCE(MAX(version),0)+1 FROM plans WHERE student_id=? AND academic_year=?', (sid, year)).fetchone()[0]
             con.execute('INSERT INTO plans VALUES (?,?,?,?,?,?)', (ident, sid, year, version, 'Черновик', now()))
@@ -375,6 +385,9 @@ def snapshot():
         result['databases'].append({'name': 'AuditDb.sqlite3', 'module': 'Журнал действий', 'bytes': (DATA / 'AuditDb.sqlite3').stat().st_size})
         result['csrf'] = TOKEN
         result['today'] = date.today().isoformat()
+        result['organization'] = documents.settings(sys.modules[__name__])
+        result['documents'] = documents.listing(sys.modules[__name__])
+        result['assistant'] = assistant_service.configuration()
         return result
 
 
@@ -439,9 +452,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get('Host') not in (f'127.0.0.1:{self.server.server_port}', f'localhost:{self.server.server_port}'):
                 return self.response(403, {'error': 'Недопустимый адрес сервера'})
             path = urlparse(self.path).path
-            if method == 'GET' and path in ('/', '/app.js', '/style.css'):
-                filename = {'/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css'}[path]
-                mime = {'/': 'text/html', '/app.js': 'text/javascript', '/style.css': 'text/css'}[path]
+            if method == 'GET' and path in ('/', '/app.js', '/style.css', '/enhancements.js', '/enhancements.css', '/document.css', '/document.js'):
+                filename = 'index.html' if path == '/' else path.lstrip('/')
+                mime = 'text/html' if path == '/' else 'text/javascript' if path.endswith('.js') else 'text/css'
                 return self.response(200, (ROOT / 'static' / filename).read_bytes(), mime + '; charset=utf-8')
             if method == 'POST' and path == '/api/login':
                 # JSON + проверка Origin не позволяют стороннему сайту отправлять формы входа.
@@ -462,6 +475,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self.response(401, {'error': 'Войдите в систему'})
             if method != 'GET' and not hmac.compare_digest(self.headers.get('X-CSRF-Token', ''), TOKEN):
                 return self.response(403, {'error': 'Обновите страницу и повторите действие'})
+            core = sys.modules[__name__]
+            if method == 'PUT' and path == '/api/settings':
+                return self.response(200, documents.save_settings(core, self.body()))
+            if method == 'POST' and path == '/api/documents':
+                return self.response(201, documents.create(core, self.body()))
+            if method == 'GET' and path.startswith('/api/documents/'):
+                ident = path.rsplit('/', 1)[1]
+                is_docx = ident.endswith('.docx')
+                snap = documents.snapshot(core, ident[:-5] if is_docx else ident)
+                if is_docx:
+                    return self.response(200, documents.docx_document(snap), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', {'Content-Disposition':'attachment; filename="department-document.docx"'})
+                return self.response(200, documents.html_document(snap), 'text/html; charset=utf-8')
+            session = next((x.strip().split('=',1)[1] for x in self.headers.get('Cookie','').split(';') if x.strip().startswith('arm_session=')), '')
+            if method == 'POST' and path == '/api/assistant':
+                return self.response(200, assistant_service.chat(core, self.body(), session))
+            if method == 'POST' and path.startswith('/api/assistant/approve/'):
+                return self.response(200, assistant_service.approve(core, path.rsplit('/',1)[1], session))
             if method == 'GET' and path == '/api/state':
                 return self.response(200, snapshot())
             if method == 'GET' and path.startswith('/api/export/'):
