@@ -1,0 +1,179 @@
+# Архитектура проекта
+
+## Общая схема
+
+```mermaid
+flowchart LR
+ B[Браузер HTML CSS JavaScript] -->|HTTP JSON| H[Python HTTP API]
+ H --> A[Проверка сессии и CSRF]
+ A --> S[Сервисы и валидация]
+ S --> D1[(StudentsDb)]
+ S --> D2[(ExamsDb)]
+ S --> D3[(TopicsDb)]
+ S --> D4[(PublicationsDb)]
+ S --> D5[(AttestationDb)]
+ S --> D6[(PlansDb)]
+ S --> D7[(AuditDb)]
+ T[Фоновая проверка раз в минуту] --> D5
+```
+
+HTML, CSS и JavaScript находятся в `static/`. Сервер и доменные функции — в `app.py`. SQLite-файлы создаются автоматически при запуске. Для учебной простоты сервер, маршруты и сервисы собраны в одном модуле, а их функции разделены логически.
+
+## Схема данных
+
+```mermaid
+erDiagram
+ students {
+  TEXT id PK
+  TEXT name
+  TEXT program
+  INTEGER year
+  TEXT supervisor
+  TEXT email
+  TEXT status
+ }
+ exams {
+  TEXT id PK
+  TEXT student_id "логическая ссылка"
+  TEXT subject
+  INTEGER semester
+  INTEGER attempt
+  TEXT exam_date
+  INTEGER grade
+  TEXT status
+ }
+ topics {
+  TEXT id PK
+  TEXT student_id UK
+  TEXT title
+  TEXT status
+  TEXT approved_on
+ }
+ topic_history {
+  TEXT id PK
+  TEXT topic_id FK
+  TEXT old_title
+  TEXT new_title
+  TEXT changed_at
+ }
+ publications {
+  TEXT id PK
+  TEXT title
+  TEXT journal
+  INTEGER year
+  TEXT doi UK
+  INTEGER vak
+  INTEGER scopus
+  INTEGER verified
+ }
+ authors {
+  TEXT publication_id PK,FK
+  TEXT student_id PK
+ }
+ attestations {
+  TEXT id PK
+  TEXT student_id
+  TEXT academic_year
+  TEXT due_date
+  TEXT status
+  TEXT result
+ }
+ notifications {
+  TEXT id PK
+  TEXT attestation_id FK
+  INTEGER threshold
+  TEXT message
+  TEXT created_at
+  INTEGER is_read
+ }
+ plans {
+  TEXT id PK
+  TEXT student_id
+  TEXT academic_year
+  INTEGER version
+  TEXT status
+  TEXT created_at
+ }
+ plan_items {
+  TEXT id PK
+  TEXT plan_id FK
+  TEXT activity
+  TEXT due_date
+  TEXT status
+  TEXT source_type
+  TEXT source_id
+ }
+ audit_events {
+  TEXT id PK
+  TEXT module
+  TEXT action
+  TEXT record_id
+  TEXT created_at
+ }
+ topics ||--o{ topic_history : "история"
+ publications ||--|{ authors : "соавторы"
+ attestations ||--o{ notifications : "напоминания"
+ plans ||--|{ plan_items : "работы"
+ students ||..o{ exams : "student_id"
+ students ||..o| topics : "student_id"
+ students ||..o{ authors : "student_id"
+ students ||..o{ attestations : "student_id"
+ students ||..o{ plans : "student_id"
+```
+
+Пунктирные межбазовые связи реализованы проверками сервиса, а не SQLite FOREIGN KEY. Внутри одной базы FK включены через PRAGMA foreign_keys=ON; дочерние строки удаляются каскадно. План хранит копии описаний работ, поэтому удаление источника не удаляет работы из сохранённого плана.
+
+UNIQUE ограничения: тема на магистранта; DOI, когда он заполнен; экзамен по магистранту + дисциплине + семестру + попытке; аттестация по магистранту + учебному году; версия плана по магистранту + году + версии; уведомление по аттестации + порогу; авторство по статье + магистранту.
+
+Прикладная блокировка RLock согласует запись и межбазовые проверки в одном процессе. Это не распределённая транзакция: не запускайте два процесса приложения на одном каталоге данных и не редактируйте SQLite-файлы сторонними программами во время работы сервера.
+
+## Основные функции
+
+| Функция | Ответственность |
+|---|---|
+| init_db | Создание 7 баз, таблиц, внешних ключей и индексов |
+| validate / save | Валидация и добавление или изменение записи |
+| delete | Удаление с проверкой межбазовых связей |
+| reminders | Расчёт ближайшего порога и сохранение уведомления |
+| create_plan | Сбор работ из модулей в новую версию плана |
+| update_plan | Изменение работ и контролируемый переход статуса |
+| export_docx | Создание ZIP/OOXML документа Word |
+| snapshot | Согласованный снимок данных для интерфейса |
+| audit | Журналирование операций без содержимого персональных данных |
+| Handler | HTTP-маршрутизация, сессии, CSRF, ответы об ошибках |
+
+## API
+
+Все маршруты, кроме входа и статических файлов, требуют cookie-сессию. Для запросов изменения нужен заголовок `X-CSRF-Token`, возвращаемый в `/api/state`.
+
+| Метод и путь | Действие |
+|---|---|
+| POST /api/login | Вход с полем password |
+| POST /api/logout | Завершение текущей сессии |
+| GET /api/state | Данные разделов, уведомления, журнал и сведения о БД |
+| POST /api/students и аналогичные пути модулей | Добавление |
+| PUT /api/{module}/{id} | Изменение |
+| DELETE /api/{module}/{id} | Удаление |
+| POST /api/plans | Формирование версии по student_id и academic_year |
+| PUT /api/plans/{id} | Изменение статуса и работ |
+| GET /api/export/{plan_id} | Скачать Word |
+| POST /api/demo | Вымышленные данные для пустой системы |
+| POST /api/read-notifications | Пометить уведомления прочитанными |
+
+Модули: students, exams, topics, publications, attestations, plans. Успешное добавление возвращает 201, изменение 200; ошибки данных 400, отсутствие входа 401, нарушение CSRF 403. Доступ к серверу ограничен loopback-адресом и проверкой Host. Это учебный HTTP-сервер для локального использования, не промышленная платформа.
+
+## Напоминания
+
+1. Выбрать аттестации со статусом «Запланирована».
+2. Рассчитать число дней до срока по локальной дате компьютера.
+3. Выбрать актуальный порог: 30, 7, 1 день или просрочка.
+4. INSERT OR IGNORE по уникальной паре аттестация + порог.
+5. Показать непрочитанные уведомления на главной странице.
+
+При переносе срока уведомления этой аттестации пересоздаются. При завершении аттестации её уведомления удаляются. Пороговое уведомление создаётся один раз; его текст отражает состояние на момент создания, а текущая дата и срок видны в списке аттестаций.
+
+## План
+
+Шаблон учебного года: 1 сентября — 31 августа. Включаются обзор литературы, исследование, экзамены с датой в этом периоде, задача подготовки статьи, зарегистрированные публикации по годам и аттестация выбранного учебного года. Для формирования обязательна тема диссертации. Пользователь проверяет и редактирует черновик перед согласованием.
+
+Статусы: Черновик → На согласовании → Утверждён → Завершён. С согласования можно вернуть черновик. Утверждённое содержание неизменно; для исправления формируется новая версия. Экспорт DOCX использует сохранённые работы, но ФИО и руководителя читает из текущего профиля.
